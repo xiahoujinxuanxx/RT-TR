@@ -1,0 +1,5 @@
+{
+  "name": "LinguaFlow - Real-time AI Translator",
+  "description": "A real-time, bidirectional Chinese-English translator with voice recognition and dynamic context adjustment.",
+  "requestFramePermissions": ["microphone"]
+}

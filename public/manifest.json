@@ -1,0 +1,20 @@
+{
+  "short_name": "LinguaFlow",
+  "name": "LinguaFlow AI Translator",
+  "icons": [
+    {
+      "src": "https://picsum.photos/192/192",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://picsum.photos/512/512",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#2563eb",
+  "background_color": "#ffffff"
+}
