@@ -25,48 +25,57 @@ interface TranslationResult {
 // --- Gemini Service ---
 const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
-async function translateText(text: string): Promise<TranslationResult | null> {
-  if (!text.trim()) return null;
+async function* translateTextStream(text: string) {
+  if (!text.trim()) return;
 
   try {
     const systemInstruction = `
-      You are a professional real-time translator specializing in Chinese and English.
-      Task:
-      1. Detect if the input is Chinese or English.
-      2. If English, translate to Chinese. If Chinese, translate to English.
-      3. The input might be incomplete as it's real-time. Provide the best possible translation for the current fragment.
-      4. If the input seems like a complete sentence, ensure the translation is polished and natural.
-      5. Return ONLY a JSON object in this format:
-      {
-        "detectedLanguage": "zh" | "en",
-        "translation": "translated text",
-        "isComplete": boolean (true if the input seems like a complete thought/sentence)
-      }
+      You are a professional real-time translator. 
+      Detect if input is Chinese or English. Translate to the other.
+      The input is real-time and may be incomplete. Provide a natural, fluid translation.
+      If the input is a fragment, translate the fragment. If it's a full sentence, provide a polished version.
+      Output format: 
+      First line: "zh" or "en" (detected language)
+      Following lines: The translation text.
+      Do not use JSON for streaming to reduce latency. Just the language code then the text.
     `;
 
-    const result = await genAI.models.generateContent({
+    const result = await genAI.models.generateContentStream({
       model: "gemini-3-flash-preview",
       contents: [{ role: 'user', parts: [{ text }] }],
       config: {
         systemInstruction,
-        responseMimeType: "application/json",
+        temperature: 0.2, // Lower temperature for faster, more consistent results
       }
     });
 
-    const responseText = result.text;
-    if (responseText) {
-      return JSON.parse(responseText.trim()) as TranslationResult;
+    let detectedLang = '';
+    let fullText = '';
+    
+    for await (const chunk of result) {
+      const chunkText = chunk.text;
+      if (!chunkText) continue;
+      
+      if (!detectedLang) {
+        const lines = chunkText.split('\n');
+        detectedLang = lines[0].trim().toLowerCase().includes('zh') ? 'zh' : 'en';
+        const remaining = lines.slice(1).join('\n');
+        fullText += remaining;
+        yield { detectedLanguage: detectedLang as 'zh' | 'en', translation: fullText };
+      } else {
+        fullText += chunkText;
+        yield { detectedLanguage: detectedLang as 'zh' | 'en', translation: fullText };
+      }
     }
   } catch (error) {
     console.error("Translation error:", error);
   }
-  return null;
 }
 
 // --- Main App ---
 export default function App() {
   const [input, setInput] = useState('');
-  const [translation, setTranslation] = useState<TranslationResult | null>(null);
+  const [translation, setTranslation] = useState<{ detectedLanguage: 'zh' | 'en', translation: string } | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranslating, setIsTranslating] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -76,6 +85,7 @@ export default function App() {
   const recognitionRef = useRef<any>(null);
   const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Initialize Speech Recognition
   useEffect(() => {
@@ -84,7 +94,8 @@ export default function App() {
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
       recognition.interimResults = true;
-      recognition.lang = 'zh-CN';
+      // Use a more flexible language setting if possible, or stick to zh-CN which often handles English too
+      recognition.lang = 'zh-CN'; 
 
       recognition.onresult = (event: any) => {
         let interimTranscript = '';
@@ -98,35 +109,56 @@ export default function App() {
           }
         }
 
+        // Prioritize final transcript but show interim for real-time feel
         const currentText = finalTranscript || interimTranscript;
         if (currentText) {
-          setInput(currentText);
+          setInput(prev => {
+            // If it's a final result, we might want to append or replace
+            // For this app, we replace for simplicity in "real-time" mode
+            return currentText;
+          });
         }
       };
 
       recognition.onerror = (event: any) => {
         console.error('Speech recognition error:', event.error);
+        if (event.error === 'no-speech') {
+          // Don't stop on no-speech, just keep listening
+          return;
+        }
         setIsRecording(false);
       };
 
       recognition.onend = () => {
-        setIsRecording(false);
+        // Auto-restart if we're still supposed to be recording
+        if (isRecording) {
+          try {
+            recognition.start();
+          } catch (e) {
+            setIsRecording(false);
+          }
+        }
       };
 
       recognitionRef.current = recognition;
     }
-  }, []);
+  }, [isRecording]);
 
   const toggleRecording = () => {
     if (isRecording) {
+      setIsRecording(false);
       recognitionRef.current?.stop();
     } else {
       setIsRecording(true);
-      recognitionRef.current?.start();
+      try {
+        recognitionRef.current?.start();
+      } catch (e) {
+        console.error("Start error", e);
+      }
     }
   };
 
-  // Real-time translation logic with debounce
+  // Real-time translation logic with streaming
   const performTranslation = useCallback(async (text: string) => {
     if (!text.trim()) {
       setTranslation(null);
@@ -135,11 +167,23 @@ export default function App() {
     }
 
     setIsTranslating(true);
-    const result = await translateText(text);
-    if (result) {
-      setTranslation(result);
+    
+    // Cancel previous translation if any
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
     }
-    setIsTranslating(false);
+    abortControllerRef.current = new AbortController();
+
+    try {
+      const stream = translateTextStream(text);
+      for await (const result of stream) {
+        setTranslation(result);
+      }
+    } catch (e) {
+      console.error("Stream error", e);
+    } finally {
+      setIsTranslating(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -148,9 +192,11 @@ export default function App() {
     }
 
     if (input) {
+      // Shorter debounce for faster response
+      const delay = input.length < 5 ? 200 : 400;
       debounceTimerRef.current = setTimeout(() => {
         performTranslation(input);
-      }, 600);
+      }, delay);
     } else {
       setTranslation(null);
     }
@@ -335,7 +381,7 @@ export default function App() {
                         className={cn(
                           "text-4xl font-light leading-tight tracking-tight",
                           translation.detectedLanguage === 'en' ? 'font-serif' : 'font-sans',
-                          !translation.isComplete && "opacity-60"
+                          isTranslating && "opacity-60"
                         )}
                       >
                         {translation.translation}
